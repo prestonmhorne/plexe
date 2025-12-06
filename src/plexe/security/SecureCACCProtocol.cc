@@ -93,10 +93,32 @@ void SecureCACCProtocol::initialize(int stage)
 
             // Set attack-specific parameters (all from peer-reviewed literature)
             switch (attackType) {
+                //=============================================================
+                // SPEED FIELD ATTACKS
+                //=============================================================
+                case AttackType::CONSTANT:
+                    // van der Heijden VNC 2017: constant fake speed value
+                    attacker_.setFakeValue(attackMagnitude_);
+                    break;
                 case AttackType::OFFSET:
                     // van der Heijden VNC 2017: speed offset attack (50, 100, 150 m/s)
                     attacker_.setOffsetValue(attackMagnitude_);
                     break;
+                case AttackType::DRIFT:
+                    // Amoozadeh IEEE CommMag 2015: gradual speed drift (m/s per second)
+                    attacker_.setDriftRate(attackMagnitude_);
+                    break;
+                case AttackType::REPLAY:
+                    // SAE J2735, ETSI ITS-G5: replay old BSM data (delay in seconds)
+                    attacker_.setReplayDelay(attackMagnitude_);
+                    break;
+                case AttackType::NOISE:
+                    // REPLACE taxonomy: amplified measurement noise (multiplier)
+                    attacker_.setNoiseMultiplier(attackMagnitude_);
+                    break;
+                //=============================================================
+                // ACCELERATION FIELD ATTACKS
+                //=============================================================
                 case AttackType::ACCEL_OFFSET:
                     // van der Heijden VNC 2017: acceleration offset (-30 to +30 m/s^2)
                     accelAttacker_.configure(attackStartTime_, attackType, duration);
@@ -107,6 +129,9 @@ void SecureCACCProtocol::initialize(int stage)
                     accelAttacker_.configure(attackStartTime_, attackType, duration);
                     accelAttacker_.setAccelFakeValue(attackMagnitude_);
                     break;
+                //=============================================================
+                // POSITION FIELD ATTACKS
+                //=============================================================
                 case AttackType::POSITION_SHIFT:
                     // van der Heijden VNC 2017: position falsification (3-11 m/s shift rate)
                     positionAttacker_.configure(attackStartTime_, attackType, duration);
@@ -127,9 +152,16 @@ AttackType SecureCACCProtocol::parseAttackType(const std::string& type)
 {
     // All attacks from peer-reviewed CACC security literature
     if (type == "none") return AttackType::NONE;
+    // Speed field attacks
+    if (type == "constant") return AttackType::CONSTANT;       // van der Heijden VNC 2017
     if (type == "offset") return AttackType::OFFSET;           // van der Heijden VNC 2017
+    if (type == "drift") return AttackType::DRIFT;             // Amoozadeh IEEE CommMag 2015
+    if (type == "replay") return AttackType::REPLAY;           // SAE J2735, ETSI ITS-G5
+    if (type == "noise") return AttackType::NOISE;             // REPLACE taxonomy
+    // Acceleration field attacks
     if (type == "accel_offset") return AttackType::ACCEL_OFFSET;     // van der Heijden VNC 2017
     if (type == "accel_constant") return AttackType::ACCEL_CONSTANT; // Amoozadeh IEEE CommMag 2015
+    // Position field attacks
     if (type == "position_shift") return AttackType::POSITION_SHIFT; // van der Heijden VNC 2017
     return AttackType::NONE;
 }

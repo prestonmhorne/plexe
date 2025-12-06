@@ -48,20 +48,25 @@ simple SecureCACCProtocol extends SimplePlatooningBeaconing
 
         //=====================================================================
         // Attack Injection (for benchmarking/testing)
+        // All 8 FDI attacks from peer-reviewed CACC security literature
         //=====================================================================
         bool attackerEnabled = default(false);
 
-        // Attack type: none, constant, offset, random, noise, replay, drift, denial
+        // Attack type - 8 standard FDI attacks:
+        //   Speed field:  constant, offset, drift, replay, noise
+        //   Accel field:  accel_offset, accel_constant
+        //   Position:     position_shift
         string attackType = default("none");
 
         // Attack magnitude (interpretation depends on attack type):
-        //   - constant: the fake value to report
-        //   - offset: meters to add to true value
-        //   - random: max range for random values
-        //   - noise: noise multiplier
-        //   - drift: drift rate in m/s
-        //   - denial: drop probability (0-1)
-        //   - replay: not used (uses fixed 3s delay)
+        //   - constant:       fake speed value (m/s) [van der Heijden VNC 2017]
+        //   - offset:         speed offset (m/s) [van der Heijden: 50, 100, 150]
+        //   - drift:          drift rate (m/s per second) [Amoozadeh]
+        //   - replay:         replay delay (seconds) [SAE J2735]
+        //   - noise:          noise multiplier [REPLACE taxonomy]
+        //   - accel_offset:   accel offset (m/s^2) [van der Heijden: -30 to +30]
+        //   - accel_constant: fake accel value (m/s^2) [Amoozadeh: 6]
+        //   - position_shift: position shift rate (m/s) [van der Heijden: 3-11]
         double attackMagnitude = default(0.0);
 
         // When attack starts (simulation seconds)
