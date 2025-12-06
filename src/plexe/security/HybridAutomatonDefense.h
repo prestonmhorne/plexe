@@ -158,6 +158,8 @@ public:
         attackDetected_ = false;
         detectionTime_ = NAN;
     }
+
+    void setAnomalyThreshold(double threshold) { anomalyThreshold_ = threshold; }
 };
 
 //=============================================================================
@@ -538,6 +540,26 @@ public:
 
 //=============================================================================
 // VarianceDetector - Detects noise injection via abnormal variance
+//
+// KNOWN LIMITATION - WARM-UP PERIOD VULNERABILITY:
+// This detector requires 50 samples (5 seconds at 10Hz) to establish a baseline
+// variance before it can detect attacks. During this warm-up period:
+//
+// 1. If an attack starts DURING warm-up (t < 5s), the baseline will be
+//    contaminated with attack variance, reducing detection sensitivity.
+//
+// 2. If an attack starts BEFORE simulation (t = 0), the detector may
+//    never establish a clean baseline, causing false negatives.
+//
+// MITIGATION STRATEGIES:
+// - Ensure attacks start after t = 5s (warm-up complete)
+// - Use pre-computed baseline from calibration runs
+// - Combine with other detectors (ensemble voting provides redundancy)
+// - Consider adaptive baseline that excludes outliers
+//
+// Per van der Heijden VNC 2017: attacks typically start after platoon formation,
+// so this limitation has minimal impact in realistic scenarios where vehicles
+// join an existing platoon (baseline established before attacker arrives).
 //=============================================================================
 class VarianceDetector {
 private:
@@ -549,6 +571,9 @@ private:
     int baselineSamples_;
     bool attackDetected_;
     double detectionTime_;
+
+    // Warm-up tracking for diagnostics
+    static constexpr int WARMUP_SAMPLES = 50;  // 5 seconds at 10Hz
 
 public:
     // Paper Eq. 15: k = 1.8 (variance multiplier threshold)
@@ -623,22 +648,36 @@ public:
         attackDetected_ = false;
         detectionTime_ = NAN;
     }
+
+    // Check if baseline establishment (warm-up) is complete
+    bool isWarmupComplete() const { return baselineSet_; }
+
+    // Get current baseline variance (for diagnostics)
+    double getBaselineVariance() const { return baselineVariance_; }
+
+    // Get warm-up progress (0.0 to 1.0)
+    double getWarmupProgress() const {
+        return std::min(1.0, static_cast<double>(baselineSamples_) / WARMUP_SAMPLES);
+    }
 };
 
 //=============================================================================
-// EnsembleDetector - 5 detectors (4 original + replay) for FDI attacks
+// EnsembleDetector - Multi-field FDI attack detection
 //
 // Paper Eq. 17: Φ_ensemble(t) = 1_{φ_thresh + φ_obs + φ_cusum + φ_var + φ_replay >= 2}
 //
-// IMPROVEMENT: Added ReplayDetector to overcome the steady-state replay limitation.
-// The replay detector uses cross-correlation analysis to detect temporal misalignment
-// between BSM and radar data. During transient maneuvers (speed changes), replayed
-// BSM values will decorrelate from current radar readings, enabling detection.
+// ARCHITECTURE: Parallel detection on speed AND acceleration fields
+// Per van der Heijden VNC 2017: "manipulation of the transmitted acceleration
+// ...affects ALL controllers" - acceleration attacks are the most dangerous.
+//
+// Speed field detectors (5):
+//   - Threshold, Kalman, CUSUM, Variance, Replay
+// Acceleration field detectors (3):
+//   - Threshold, Kalman, CUSUM (variance/replay less applicable to accel)
 //
 // SCOPE: This ensemble detects False Data Injection (FDI) attacks that
 // manipulate BSM content. It does NOT detect:
-//   - DoS/Denial attacks (availability attacks outside FDI scope - drop messages
-//     rather than inject false data; no residuals to compare)
+//   - DoS/Denial attacks (availability attacks outside FDI scope)
 //
 // DoS limitation is documented in Section V-B of the paper.
 //=============================================================================
@@ -647,12 +686,22 @@ public:
     enum VotingStrategy { VOTE_ANY = 1, VOTE_MAJORITY = 2, VOTE_ALL = 5 };
 
 private:
-    // 5 detectors: 4 residual-based + 1 temporal consistency detector
+    //=========================================================================
+    // Speed field detectors (5 detectors)
+    //=========================================================================
     ThresholdDetector thresholdDet_;    // Eq. 10: instantaneous residual
     KalmanDetector kalmanDet_;          // Eq. 11: observer-based
     CUSUMDetector cusumDet_;            // Eq. 13-14: sequential change detection
     VarianceDetector varianceDet_;      // Eq. 15: noise injection detection
-    ReplayDetector replayDet_;          // NEW: cross-correlation for replay detection
+    ReplayDetector replayDet_;          // Cross-correlation for replay detection
+
+    //=========================================================================
+    // Acceleration field detectors (3 detectors)
+    // Per van der Heijden: accel attacks are "most dangerous"
+    //=========================================================================
+    ThresholdDetector accelThresholdDet_;   // Instantaneous accel residual
+    KalmanDetector accelKalmanDet_;         // Observer-based accel detection
+    CUSUMDetector accelCusumDet_;           // Sequential accel change detection
 
     VotingStrategy votingStrategy_;
 
@@ -660,99 +709,207 @@ private:
     double detectionTime_;
     std::string triggeringDetector_;
 
+    //=========================================================================
+    // Warmup period - suppress detection during platoon formation
+    // During the first few seconds, sensors are stabilizing and CUSUM/Kalman
+    // may trigger false positives on normal transients.
+    //=========================================================================
+    static constexpr double WARMUP_DURATION = 5.0;  // 5 seconds warmup
+    double startTime_;
+    bool warmupComplete_;
+
+    // Output vectors for acceleration detection logging
+    cOutVector accelResidualOut_;
+    cOutVector accelVotesOut_;
+
 public:
     EnsembleDetector(VotingStrategy strategy = VOTE_MAJORITY)
         : votingStrategy_(strategy), attackDetected_(false),
-          detectionTime_(NAN), triggeringDetector_("") {}
+          detectionTime_(NAN), triggeringDetector_(""),
+          startTime_(-1.0), warmupComplete_(false),
+          // Acceleration detectors with appropriate thresholds
+          // van der Heijden Table I: accel offsets of -30 to +30 m/s²
+          // Use 4 m/s² threshold to catch moderate attacks early
+          accelThresholdDet_(4.0, 0.95),
+          accelKalmanDet_(0.5, 1.0, 3.0),   // Higher process noise for accel
+          accelCusumDet_(1.0, 8.0, 0.95) {  // Tighter drift for accel
+        accelResidualOut_.setName("accelResidual");
+        accelVotesOut_.setName("accelDetectorVotes");
+    }
 
     void configure(double thresholdLimit, double kalmanAnomalyThresh,
                    double cusumDecisionThresh) {
+        // Configure speed detectors
         thresholdDet_.setThreshold(thresholdLimit);
+        kalmanDet_.setAnomalyThreshold(kalmanAnomalyThresh);
         cusumDet_.setDecisionThreshold(cusumDecisionThresh);
     }
 
-    bool check(double v2vValue, double localValue, double currentTime,
+    void configureAccelDetector(double accelThreshold, double accelCusumThresh) {
+        accelThresholdDet_.setThreshold(accelThreshold);
+        accelCusumDet_.setDecisionThreshold(accelCusumThresh);
+    }
+
+    //=========================================================================
+    // Full check with both speed and acceleration fields
+    // bsmAccel/localAccel: acceleration values for accel attack detection
+    //=========================================================================
+    bool check(double v2vSpeed, double localSpeed, double currentTime,
                double& confidence, double& anomalyScore, int& votes,
-               double bsmTimestamp = -1.0) {
+               double bsmTimestamp = -1.0,
+               double bsmAccel = NAN, double localAccel = NAN) {
+        //=====================================================================
+        // Warmup period: suppress detection during platoon formation
+        // This prevents false positives from normal transients and sensor noise
+        // during the first WARMUP_DURATION seconds after first call.
+        //=====================================================================
+        if (startTime_ < 0) {
+            startTime_ = currentTime;
+        }
+        if (!warmupComplete_ && (currentTime - startTime_) < WARMUP_DURATION) {
+            // Still in warmup - update detectors but don't report detection
+            // This allows CUSUM/Kalman to calibrate on normal data
+            double dummy_conf, dummy_score;
+            thresholdDet_.check(v2vSpeed, localSpeed, currentTime, dummy_conf, dummy_score);
+            kalmanDet_.check(v2vSpeed, localSpeed, currentTime, dummy_conf, dummy_score);
+            cusumDet_.check(v2vSpeed, localSpeed, currentTime, dummy_conf, dummy_score);
+            varianceDet_.check(v2vSpeed, localSpeed, currentTime, dummy_conf, dummy_score);
+            if (!std::isnan(bsmAccel) && !std::isnan(localAccel)) {
+                accelThresholdDet_.check(bsmAccel, localAccel, currentTime, dummy_conf, dummy_score);
+                accelKalmanDet_.check(bsmAccel, localAccel, currentTime, dummy_conf, dummy_score);
+                accelCusumDet_.check(bsmAccel, localAccel, currentTime, dummy_conf, dummy_score);
+            }
+            confidence = 0.0;
+            anomalyScore = 0.0;
+            votes = 0;
+            return false;
+        }
+        warmupComplete_ = true;
+
         double conf1, conf2, conf3, conf4, conf5;
         double score1, score2, score3, score4, score5;
 
-        // Run all 5 detectors (4 original + replay)
-        bool det1 = thresholdDet_.check(v2vValue, localValue, currentTime, conf1, score1);
-        bool det2 = kalmanDet_.check(v2vValue, localValue, currentTime, conf2, score2);
-        bool det3 = cusumDet_.check(v2vValue, localValue, currentTime, conf3, score3);
-        bool det4 = varianceDet_.check(v2vValue, localValue, currentTime, conf4, score4);
+        //=====================================================================
+        // Speed field detection (5 detectors)
+        //=====================================================================
+        bool det1 = thresholdDet_.check(v2vSpeed, localSpeed, currentTime, conf1, score1);
+        bool det2 = kalmanDet_.check(v2vSpeed, localSpeed, currentTime, conf2, score2);
+        bool det3 = cusumDet_.check(v2vSpeed, localSpeed, currentTime, conf3, score3);
+        bool det4 = varianceDet_.check(v2vSpeed, localSpeed, currentTime, conf4, score4);
 
-        // Replay detection: use timestamp freshness (primary) if available,
-        // otherwise fall back to cross-correlation (secondary)
+        // Replay detection: use timestamp freshness (primary) if available
         bool det5 = false;
-        bool replayTimestampDetection = false;  // Track if timestamp-based detection fired
+        bool replayTimestampDetection = false;
         if (bsmTimestamp > 0) {
-            // Primary: timestamp freshness check - immediate detection
             det5 = replayDet_.checkTimestamp(bsmTimestamp, currentTime, conf5, score5);
-            replayTimestampDetection = det5;  // Authoritative if timestamp is stale
+            replayTimestampDetection = det5;
         }
         if (!det5) {
-            // Secondary: cross-correlation for forged timestamps
-            det5 = replayDet_.check(v2vValue, localValue, currentTime, conf5, score5);
+            det5 = replayDet_.check(v2vSpeed, localSpeed, currentTime, conf5, score5);
         }
 
-        // Count votes from 5 detectors (modified Eq. 12 to include replay)
-        votes = (det1 ? 1 : 0) + (det2 ? 1 : 0) + (det3 ? 1 : 0) + (det4 ? 1 : 0) + (det5 ? 1 : 0);
+        //=====================================================================
+        // Acceleration field detection (3 detectors)
+        // Per van der Heijden VNC 2017: "Most dangerous attack - affects ALL controllers"
+        //=====================================================================
+        bool accelDet1 = false, accelDet2 = false, accelDet3 = false;
+        double accelConf1 = 0, accelConf2 = 0, accelConf3 = 0;
+        double accelScore1 = 0, accelScore2 = 0, accelScore3 = 0;
+        int accelVotes = 0;
 
-        // Timestamp-based replay detection is authoritative - stale timestamps are
-        // definitive evidence of replay attack, bypass voting threshold
+        if (!std::isnan(bsmAccel) && !std::isnan(localAccel)) {
+            accelDet1 = accelThresholdDet_.check(bsmAccel, localAccel, currentTime, accelConf1, accelScore1);
+            accelDet2 = accelKalmanDet_.check(bsmAccel, localAccel, currentTime, accelConf2, accelScore2);
+            accelDet3 = accelCusumDet_.check(bsmAccel, localAccel, currentTime, accelConf3, accelScore3);
+
+            accelVotes = (accelDet1 ? 1 : 0) + (accelDet2 ? 1 : 0) + (accelDet3 ? 1 : 0);
+
+            // Log acceleration detection
+            accelResidualOut_.record(std::abs(bsmAccel - localAccel));
+            accelVotesOut_.record(accelVotes);
+        }
+
+        //=====================================================================
+        // Combined voting: speed OR acceleration attack triggers defense
+        // Speed: 2-of-5 threshold
+        // Accel: 2-of-3 threshold (more sensitive due to danger level)
+        //=====================================================================
+        int speedVotes = (det1 ? 1 : 0) + (det2 ? 1 : 0) + (det3 ? 1 : 0) + (det4 ? 1 : 0) + (det5 ? 1 : 0);
+
+        // Timestamp-based replay detection is authoritative
         if (replayTimestampDetection) {
-            votes = 2;  // Force voting threshold to be met
+            speedVotes = 2;
         }
 
-        // Apply voting strategy - 2-of-5 threshold voting
-        // Rationale: Heterogeneous detectors target different attack types;
-        // requiring 3+ agreement would miss specialized attacks (e.g., replay)
-        bool detected = false;
+        // Report total votes (speed votes dominate for backwards compatibility)
+        votes = speedVotes;
+
+        // Detection triggers if EITHER speed or accel ensemble detects attack
+        bool speedDetected = false;
+        bool accelDetected = accelVotes >= 2;  // 2-of-3 for acceleration
+
         switch (votingStrategy_) {
             case VOTE_ANY:
-                detected = votes >= 1;
+                speedDetected = speedVotes >= 1;
                 break;
             case VOTE_MAJORITY:
-                detected = votes >= 2;  // 2-of-5 threshold (not true majority)
+                speedDetected = speedVotes >= 2;
                 break;
             case VOTE_ALL:
-                detected = votes == 5;
+                speedDetected = speedVotes == 5;
                 break;
         }
+
+        bool detected = speedDetected || accelDetected;
 
         // Combined metrics
         if (detected) {
-            confidence = std::max({conf1, conf2, conf3, conf4, conf5});
+            confidence = std::max({conf1, conf2, conf3, conf4, conf5, accelConf1, accelConf2, accelConf3});
         } else {
             confidence = 0.0;
         }
-        anomalyScore = std::max({score1, score2, score3, score4, score5});
+        anomalyScore = std::max({score1, score2, score3, score4, score5, accelScore1, accelScore2, accelScore3});
 
         // Record first detection and which detector triggered
         if (detected && !attackDetected_) {
             attackDetected_ = true;
             detectionTime_ = currentTime;
-            if (det1) triggeringDetector_ = "threshold";
-            else if (det2) triggeringDetector_ = "kalman";
-            else if (det3) triggeringDetector_ = "cusum";
-            else if (det4) triggeringDetector_ = "variance";
-            else if (det5) triggeringDetector_ = "replay";
+            // Determine triggering detector
+            if (accelDetected && !speedDetected) {
+                if (accelDet1) triggeringDetector_ = "accel_threshold";
+                else if (accelDet2) triggeringDetector_ = "accel_kalman";
+                else if (accelDet3) triggeringDetector_ = "accel_cusum";
+            } else {
+                if (det1) triggeringDetector_ = "threshold";
+                else if (det2) triggeringDetector_ = "kalman";
+                else if (det3) triggeringDetector_ = "cusum";
+                else if (det4) triggeringDetector_ = "variance";
+                else if (det5) triggeringDetector_ = "replay";
+            }
         }
 
         return detected;
     }
 
     void reset() {
+        // Reset speed detectors
         thresholdDet_.reset();
         kalmanDet_.reset();
         cusumDet_.reset();
         varianceDet_.reset();
         replayDet_.reset();
+        // Reset acceleration detectors
+        accelThresholdDet_.reset();
+        accelKalmanDet_.reset();
+        accelCusumDet_.reset();
+
         attackDetected_ = false;
         detectionTime_ = NAN;
         triggeringDetector_ = "";
+
+        // Reset warmup state
+        startTime_ = -1.0;
+        warmupComplete_ = false;
     }
 
     double getDetectionTime() const { return detectionTime_; }
@@ -761,16 +918,39 @@ public:
 
 //=============================================================================
 // ACCHybridAutomaton - Port of ACCHybridAutomaton.m
+//
+// Implements graceful degradation through headway adjustment per Ploeg 2015:
+//   - NORMAL: Full CACC with h = 0.5s (string stable with V2V feedforward)
+//   - ATTACK_DETECTED: Degraded CACC with h >= 1.24s (Kalman-estimated accel)
+//   - DEFENSE_ACTIVE: ACC fallback with h >= 3.16s (radar-only, no feedforward)
+//   - DEGRADED: Conservative ACC with h >= 3.16s and safety margins
+//
+// Headway values from Ploeg et al. IEEE T-ITS 2015:
+//   - CACC: h >= 0.25s (we use 0.5s for safety margin)
+//   - dCACC: h >= 1.23s (degraded CACC with estimated acceleration)
+//   - ACC: h >= 3.16s (radar-only string stability requirement)
 //=============================================================================
 class ACCHybridAutomaton {
 private:
     DefenseMode currentMode_;
+    DefenseMode previousMode_;  // Track mode changes for headway updates
     double modeEntryTime_;
 
     // Timing parameters (matches MATLAB properties)
     double confirmationTime_;          // Time to confirm attack before mode switch
     double transitionDelay_;           // Delay for mode transitions
     double localSensorTrustThreshold_; // Min confidence to trust local sensor
+
+    // Headway parameters per Ploeg 2015 string stability analysis
+    // These are the MINIMUM headways for string stability in each mode
+    static constexpr double HEADWAY_NORMAL = 0.5;      // Full CACC (paper: h >= 0.25s, use 0.5s)
+    static constexpr double HEADWAY_DETECTED = 1.24;   // Degraded CACC (paper: h >= 1.23s)
+    static constexpr double HEADWAY_ACTIVE = 3.16;     // ACC fallback (paper: h >= 3.16s)
+    static constexpr double HEADWAY_DEGRADED = 3.16;   // Conservative ACC
+
+    // Current target headway
+    double targetHeadway_;
+    bool headwayChanged_;  // Flag to signal controller update needed
 
     // Detection confirmation state
     int consecutiveDetections_;
@@ -784,23 +964,29 @@ private:
     // Output vectors for logging
     cOutVector modeOut_;
     cOutVector detectedOut_;
+    cOutVector headwayOut_;
 
 public:
     ACCHybridAutomaton(double confirmationTime = 0.3,
                        double transitionDelay = 0.2,
                        double sensorTrustThreshold = 0.5)
-        : currentMode_(DefenseMode::NORMAL), modeEntryTime_(0),
+        : currentMode_(DefenseMode::NORMAL), previousMode_(DefenseMode::NORMAL),
+          modeEntryTime_(0),
           confirmationTime_(confirmationTime), transitionDelay_(transitionDelay),
           localSensorTrustThreshold_(sensorTrustThreshold),
+          targetHeadway_(HEADWAY_NORMAL), headwayChanged_(false),
           consecutiveDetections_(0), detectionStartTime_(NAN),
           hasPendingTransition_(false) {
         modeOut_.setName("defenseMode");
         detectedOut_.setName("attackDetected");
+        headwayOut_.setName("targetHeadway");
     }
 
     void transition(bool attackDetected, double currentTime,
                     double localSensorConfidence = 1.0) {
         DefenseMode oldMode = currentMode_;
+        previousMode_ = currentMode_;
+        headwayChanged_ = false;
 
         // Handle pending transitions (delayed mode switches)
         if (hasPendingTransition_ && currentTime >= pendingTransitionTime_) {
@@ -868,17 +1054,48 @@ public:
                 break;
         }
 
+        // Update headway based on mode (Ploeg 2015 string stability requirements)
+        if (oldMode != currentMode_) {
+            updateHeadwayForMode();
+            headwayChanged_ = true;
+            EV_INFO << "Mode transition: " << getModeString(oldMode)
+                    << " -> " << getModeString(currentMode_)
+                    << " at t=" << currentTime
+                    << ", headway: " << targetHeadway_ << "s\n";
+        }
+
         // Record for output
         modeOut_.record(static_cast<int>(currentMode_));
         detectedOut_.record(attackDetected ? 1 : 0);
+        headwayOut_.record(targetHeadway_);
+    }
 
-        // Log transition
-        if (oldMode != currentMode_) {
-            EV_INFO << "Mode transition: " << getModeString(oldMode)
-                    << " -> " << getModeString(currentMode_)
-                    << " at t=" << currentTime << "\n";
+private:
+    // Update target headway based on current defense mode
+    // Per Ploeg et al. IEEE T-ITS 2015: String stability requirements
+    void updateHeadwayForMode() {
+        switch (currentMode_) {
+            case DefenseMode::NORMAL:
+                // Full CACC: h >= 0.25s theoretical, use 0.5s for practical margin
+                targetHeadway_ = HEADWAY_NORMAL;
+                break;
+            case DefenseMode::ATTACK_DETECTED:
+                // Degraded CACC: h >= 1.23s (using Kalman-estimated acceleration)
+                // Rounded to 1.24s per paper
+                targetHeadway_ = HEADWAY_DETECTED;
+                break;
+            case DefenseMode::DEFENSE_ACTIVE:
+                // ACC fallback: h >= 3.16s (radar-only, no feedforward)
+                targetHeadway_ = HEADWAY_ACTIVE;
+                break;
+            case DefenseMode::DEGRADED:
+                // Conservative ACC: same as ACTIVE but with safety margins in fusion
+                targetHeadway_ = HEADWAY_DEGRADED;
+                break;
         }
     }
+
+public:
 
     double fuseSensors(double v2vValue, double localValue) {
         // Compute fused sensor value based on current mode
@@ -912,6 +1129,17 @@ public:
 
     DefenseMode getMode() const { return currentMode_; }
 
+    // Headway management for graceful degradation
+    double getTargetHeadway() const { return targetHeadway_; }
+    bool hasHeadwayChanged() const { return headwayChanged_; }
+    void clearHeadwayChanged() { headwayChanged_ = false; }
+
+    // Check if we should use ACC (no feedforward) vs CACC
+    bool shouldUseACC() const {
+        return currentMode_ == DefenseMode::DEFENSE_ACTIVE ||
+               currentMode_ == DefenseMode::DEGRADED;
+    }
+
     static const char* getModeString(DefenseMode mode) {
         switch (mode) {
             case DefenseMode::NORMAL: return "NORMAL";
@@ -928,7 +1156,10 @@ public:
 
     void reset() {
         currentMode_ = DefenseMode::NORMAL;
+        previousMode_ = DefenseMode::NORMAL;
         modeEntryTime_ = 0;
+        targetHeadway_ = HEADWAY_NORMAL;
+        headwayChanged_ = false;
         consecutiveDetections_ = 0;
         detectionStartTime_ = NAN;
         hasPendingTransition_ = false;
