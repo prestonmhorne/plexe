@@ -1,0 +1,10 @@
+#!/bin/sh
+
+#
+# run - Launch security benchmark simulations
+#
+# CS 6376 Final Project - Resilient V2V ACC Defense
+# Vanderbilt University - Preston Horne
+#
+
+exec ../../bin/plexe_run "$@"
