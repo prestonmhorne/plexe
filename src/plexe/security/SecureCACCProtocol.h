@@ -29,6 +29,11 @@ using namespace omnetpp;
 class SecureCACCProtocol : public SimplePlatooningBeaconing {
 private:
     //=========================================================================
+    // Defense Enable/Disable (for benchmarking comparison)
+    //=========================================================================
+    bool defenseEnabled_;
+
+    //=========================================================================
     // Attack Injection (for testing/benchmarking)
     //=========================================================================
     bool attackerEnabled_;

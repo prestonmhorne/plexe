@@ -17,7 +17,8 @@ namespace security {
 Define_Module(SecureCACCProtocol);
 
 SecureCACCProtocol::SecureCACCProtocol()
-    : attackerEnabled_(false),
+    : defenseEnabled_(true),
+      attackerEnabled_(false),
       radarNoise_(0.5),
       rng_(std::random_device{}()),
       radarNoiseDist_(0.0, 0.5),
@@ -85,6 +86,9 @@ void SecureCACCProtocol::initialize(int stage)
 
         // Configure radar noise distribution
         radarNoiseDist_ = std::normal_distribution<double>(0.0, radarNoise_);
+
+        // Read defense enable parameter
+        defenseEnabled_ = par("defenseEnabled").boolValue();
 
         // Configure ensemble detector thresholds
         // Paper Eq. 10: τ_th = 3 m/s (speedThreshold_)
@@ -385,37 +389,69 @@ void SecureCACCProtocol::messageReceived(PlatooningBeacon* pkt, BaseFrame1609_4*
     // Per van der Heijden VNC 2017: accel attacks are "most dangerous"
     //=========================================================================
     double confidence, anomalyScore;
-    int votes;
-    bool attackDetected = detector_.check(bsmSpeed, radarSpeed, currentTime,
-                                          confidence, anomalyScore, votes,
-                                          bsmTimestamp,
-                                          bsmAccel, localAccel);
+    int votes = 0;
+    bool attackDetected = false;
+    double fusedSpeed = bsmSpeed;  // Default: trust BSM (no defense)
 
-    detectorVotesOut_.record(votes);
+    if (defenseEnabled_) {
+        // Run detection only if defense is enabled
+        attackDetected = detector_.check(bsmSpeed, radarSpeed, currentTime,
+                                              confidence, anomalyScore, votes,
+                                              bsmTimestamp,
+                                              bsmAccel, localAccel);
 
-    //=========================================================================
-    // Hybrid Automaton State Transition
-    //=========================================================================
-    // Local sensor confidence based on radar availability
-    double localSensorConfidence = 1.0;  // Assume radar always available in simulation
+        detectorVotesOut_.record(votes);
 
-    automaton_.transition(attackDetected, currentTime, localSensorConfidence);
+        //=========================================================================
+        // Hybrid Automaton State Transition
+        //=========================================================================
+        // Local sensor confidence based on radar availability
+        double localSensorConfidence = 1.0;  // Assume radar always available in simulation
 
-    DefenseMode mode = automaton_.getMode();
-    defenseModeOut_.record(static_cast<int>(mode));
+        automaton_.transition(attackDetected, currentTime, localSensorConfidence);
 
-    //=========================================================================
-    // Sensor Fusion based on Defense Mode
-    //=========================================================================
-    double fusedSpeed = automaton_.fuseSensors(bsmSpeed, radarSpeed);
-    fusedSpeedOut_.record(fusedSpeed);
+        DefenseMode mode = automaton_.getMode();
+        defenseModeOut_.record(static_cast<int>(mode));
 
-    // Log mode transitions
-    if (attackDetected && votes >= 2) {
-        EV_INFO << "Attack detected at t=" << currentTime
-                << " mode=" << automaton_.getModeString()
-                << " votes=" << votes
-                << " residual=" << residual << "\n";
+        //=========================================================================
+        // Sensor Fusion based on Defense Mode
+        //=========================================================================
+        fusedSpeed = automaton_.fuseSensors(bsmSpeed, radarSpeed);
+        fusedSpeedOut_.record(fusedSpeed);
+
+        // Log mode transitions
+        if (attackDetected && votes >= 2) {
+            EV_INFO << "Attack detected at t=" << currentTime
+                    << " mode=" << automaton_.getModeString()
+                    << " votes=" << votes
+                    << " residual=" << residual << "\n";
+        }
+
+        //=========================================================================
+        // Headway Adjustment (Graceful Degradation per Ploeg 2015)
+        //
+        // When defense mode changes, adjust controller headway to maintain
+        // string stability:
+        //   NORMAL: h = 0.5s (full CACC with V2V feedforward)
+        //   DETECTED: h = 1.24s (degraded CACC with estimated acceleration)
+        //   ACTIVE: h = 3.16s (ACC fallback, radar-only)
+        //   DEGRADED: h = 3.16s (conservative ACC with safety margins)
+        //=========================================================================
+        if (automaton_.hasHeadwayChanged()) {
+            applyHeadwayAdjustment();
+            automaton_.clearHeadwayChanged();
+        }
+
+        // Record current headway and controller state
+        headwayOut_.record(automaton_.getTargetHeadway());
+        activeControllerOut_.record(automaton_.shouldUseACC() ? ACC : CACC);
+    } else {
+        // Defense disabled: record baseline metrics
+        detectorVotesOut_.record(0);
+        defenseModeOut_.record(0);  // Always NORMAL
+        fusedSpeedOut_.record(bsmSpeed);  // Trust BSM directly (vulnerable)
+        headwayOut_.record(0.5);  // Fixed CACC headway
+        activeControllerOut_.record(CACC);
     }
 
     // Store for next iteration
@@ -423,25 +459,6 @@ void SecureCACCProtocol::messageReceived(PlatooningBeacon* pkt, BaseFrame1609_4*
     lastBsmDistance_ = pkt->getPositionX();  // Simplified - use X position
     lastBsmAccel_ = pkt->getAcceleration();
     lastRadarSpeed_ = radarSpeed;
-
-    //=========================================================================
-    // Headway Adjustment (Graceful Degradation per Ploeg 2015)
-    //
-    // When defense mode changes, adjust controller headway to maintain
-    // string stability:
-    //   NORMAL: h = 0.5s (full CACC with V2V feedforward)
-    //   DETECTED: h = 1.24s (degraded CACC with estimated acceleration)
-    //   ACTIVE: h = 3.16s (ACC fallback, radar-only)
-    //   DEGRADED: h = 3.16s (conservative ACC with safety margins)
-    //=========================================================================
-    if (automaton_.hasHeadwayChanged()) {
-        applyHeadwayAdjustment();
-        automaton_.clearHeadwayChanged();
-    }
-
-    // Record current headway and controller state
-    headwayOut_.record(automaton_.getTargetHeadway());
-    activeControllerOut_.record(automaton_.shouldUseACC() ? ACC : CACC);
 }
 
 //=============================================================================

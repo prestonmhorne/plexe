@@ -47,6 +47,11 @@ simple SecureCACCProtocol extends SimplePlatooningBeaconing
         double radarNoise = default(0.5);  // Radar noise std dev σ=0.5 m/s (Van der Heijden 2017)
 
         //=====================================================================
+        // Defense Enable/Disable (for benchmarking comparison)
+        //=====================================================================
+        bool defenseEnabled = default(true);  // Enable hybrid automaton defense
+
+        //=====================================================================
         // Attack Injection (for benchmarking/testing)
         // All 8 FDI attacks from peer-reviewed CACC security literature
         //=====================================================================
