@@ -4,11 +4,10 @@
 // CS 6376 Final Project - Resilient V2V ACC Defense
 // Vanderbilt University - Preston Horne
 //
-// 4-state hybrid automaton for attack-resilient ACC:
+// 3-state hybrid automaton for attack-resilient ACC:
 //   - NORMAL: Trust V2V data (q_N)
 //   - ATTACK_DETECTED: Confirming attack, blending sensors (q_D)
 //   - DEFENSE_ACTIVE: Using local sensors only (q_A)
-//   - DEGRADED: Conservative mode when local sensors unreliable (q_F)
 //
 
 #ifndef HYBRID_AUTOMATON_DEFENSE_H
@@ -32,12 +31,11 @@ inline double securityRand() {
     return dis(gen);
 }
 
-// Defense mode enumeration (matches MATLAB ACCHybridAutomaton constants)
+// Defense mode enumeration (3-state hybrid automaton)
 enum class DefenseMode {
     NORMAL = 0,           // Trust V2V data
     ATTACK_DETECTED = 1,  // Confirming attack, blending sensors
-    DEFENSE_ACTIVE = 2,   // Using local sensors only
-    DEGRADED = 3          // Conservative mode
+    DEFENSE_ACTIVE = 2    // Using local sensors only
 };
 
 //=============================================================================
@@ -714,7 +712,7 @@ private:
     // During the first few seconds, sensors are stabilizing and CUSUM/Kalman
     // may trigger false positives on normal transients.
     //=========================================================================
-    static constexpr double WARMUP_DURATION = 5.0;  // 5 seconds warmup
+    static constexpr double WARMUP_DURATION = 25.0;  // 25 seconds warmup (platoon formation)
     double startTime_;
     bool warmupComplete_;
 
@@ -831,22 +829,20 @@ public:
 
         //=====================================================================
         // Combined voting: speed OR acceleration attack triggers defense
-        // Speed: 2-of-5 threshold
-        // Accel: 2-of-3 threshold (more sensitive due to danger level)
+        // Speed: 2-of-4 voting (threshold, Kalman, CUSUM, variance)
+        // Accel: 2-of-3 voting (threshold, Kalman, CUSUM)
+        // Replay: Authoritative (immediately triggers defense, not part of voting)
         //=====================================================================
-        int speedVotes = (det1 ? 1 : 0) + (det2 ? 1 : 0) + (det3 ? 1 : 0) + (det4 ? 1 : 0) + (det5 ? 1 : 0);
-
-        // Timestamp-based replay detection is authoritative
-        if (replayTimestampDetection) {
-            speedVotes = 2;
-        }
+        int speedVotes = (det1 ? 1 : 0) + (det2 ? 1 : 0) + (det3 ? 1 : 0) + (det4 ? 1 : 0);
 
         // Report total votes (speed votes dominate for backwards compatibility)
         votes = speedVotes;
 
         // Detection triggers if EITHER speed or accel ensemble detects attack
+        // OR if replay detection triggers (authoritative)
         bool speedDetected = false;
         bool accelDetected = accelVotes >= 2;  // 2-of-3 for acceleration
+        bool replayDetected = replayTimestampDetection || det5;  // Replay is authoritative
 
         switch (votingStrategy_) {
             case VOTE_ANY:
@@ -856,11 +852,11 @@ public:
                 speedDetected = speedVotes >= 2;
                 break;
             case VOTE_ALL:
-                speedDetected = speedVotes == 5;
+                speedDetected = speedVotes == 4;
                 break;
         }
 
-        bool detected = speedDetected || accelDetected;
+        bool detected = speedDetected || accelDetected || replayDetected;
 
         // Combined metrics
         if (detected) {
@@ -874,8 +870,10 @@ public:
         if (detected && !attackDetected_) {
             attackDetected_ = true;
             detectionTime_ = currentTime;
-            // Determine triggering detector
-            if (accelDetected && !speedDetected) {
+            // Determine triggering detector (replay is authoritative, check first)
+            if (replayDetected) {
+                triggeringDetector_ = "replay";
+            } else if (accelDetected && !speedDetected) {
                 if (accelDet1) triggeringDetector_ = "accel_threshold";
                 else if (accelDet2) triggeringDetector_ = "accel_kalman";
                 else if (accelDet3) triggeringDetector_ = "accel_cusum";
@@ -884,7 +882,6 @@ public:
                 else if (det2) triggeringDetector_ = "kalman";
                 else if (det3) triggeringDetector_ = "cusum";
                 else if (det4) triggeringDetector_ = "variance";
-                else if (det5) triggeringDetector_ = "replay";
             }
         }
 
@@ -923,7 +920,6 @@ public:
 //   - NORMAL: Full CACC with h = 0.5s (string stable with V2V feedforward)
 //   - ATTACK_DETECTED: Degraded CACC with h >= 1.24s (Kalman-estimated accel)
 //   - DEFENSE_ACTIVE: ACC fallback with h >= 3.16s (radar-only, no feedforward)
-//   - DEGRADED: Conservative ACC with h >= 3.16s and safety margins
 //
 // Headway values from Ploeg et al. IEEE T-ITS 2015:
 //   - CACC: h >= 0.25s (we use 0.5s for safety margin)
@@ -939,14 +935,12 @@ private:
     // Timing parameters (matches MATLAB properties)
     double confirmationTime_;          // Time to confirm attack before mode switch
     double transitionDelay_;           // Delay for mode transitions
-    double localSensorTrustThreshold_; // Min confidence to trust local sensor
 
     // Headway parameters per Ploeg 2015 string stability analysis
     // These are the MINIMUM headways for string stability in each mode
     static constexpr double HEADWAY_NORMAL = 0.5;      // Full CACC (paper: h >= 0.25s, use 0.5s)
     static constexpr double HEADWAY_DETECTED = 1.24;   // Degraded CACC (paper: h >= 1.23s)
     static constexpr double HEADWAY_ACTIVE = 3.16;     // ACC fallback (paper: h >= 3.16s)
-    static constexpr double HEADWAY_DEGRADED = 3.16;   // Conservative ACC
 
     // Current target headway
     double targetHeadway_;
@@ -967,13 +961,11 @@ private:
     cOutVector headwayOut_;
 
 public:
-    ACCHybridAutomaton(double confirmationTime = 0.3,
-                       double transitionDelay = 0.2,
-                       double sensorTrustThreshold = 0.5)
+    ACCHybridAutomaton(double confirmationTime = 1.0,
+                       double transitionDelay = 0.5)
         : currentMode_(DefenseMode::NORMAL), previousMode_(DefenseMode::NORMAL),
           modeEntryTime_(0),
           confirmationTime_(confirmationTime), transitionDelay_(transitionDelay),
-          localSensorTrustThreshold_(sensorTrustThreshold),
           targetHeadway_(HEADWAY_NORMAL), headwayChanged_(false),
           consecutiveDetections_(0), detectionStartTime_(NAN),
           hasPendingTransition_(false) {
@@ -982,8 +974,7 @@ public:
         headwayOut_.setName("targetHeadway");
     }
 
-    void transition(bool attackDetected, double currentTime,
-                    double localSensorConfidence = 1.0) {
+    void transition(bool attackDetected, double currentTime) {
         DefenseMode oldMode = currentMode_;
         previousMode_ = currentMode_;
         headwayChanged_ = false;
@@ -995,7 +986,7 @@ public:
             hasPendingTransition_ = false;
         }
 
-        // State-specific transition logic (matches MATLAB switch statement exactly)
+        // State-specific transition logic (3-state automaton)
         switch (currentMode_) {
             case DefenseMode::NORMAL:
                 if (attackDetected) {
@@ -1020,36 +1011,25 @@ public:
             case DefenseMode::ATTACK_DETECTED:
                 // Schedule transition to defense with delay
                 if (!hasPendingTransition_) {
-                    if (localSensorConfidence >= localSensorTrustThreshold_) {
-                        pendingTransition_ = DefenseMode::DEFENSE_ACTIVE;
-                    } else {
-                        pendingTransition_ = DefenseMode::DEGRADED;
-                    }
+                    pendingTransition_ = DefenseMode::DEFENSE_ACTIVE;
                     pendingTransitionTime_ = currentTime + transitionDelay_;
                     hasPendingTransition_ = true;
                 }
                 break;
 
             case DefenseMode::DEFENSE_ACTIVE:
-                // Check if local sensor becomes unreliable
-                if (localSensorConfidence < localSensorTrustThreshold_) {
-                    currentMode_ = DefenseMode::DEGRADED;
-                    modeEntryTime_ = currentTime;
-                }
-                break;
-
-            case DefenseMode::DEGRADED:
-                // Recovery logic
-                if (localSensorConfidence >= localSensorTrustThreshold_ && attackDetected) {
-                    // Can return to DEFENSE_ACTIVE if local sensor recovers
-                    pendingTransition_ = DefenseMode::DEFENSE_ACTIVE;
-                    pendingTransitionTime_ = currentTime + transitionDelay_;
-                    hasPendingTransition_ = true;
-                } else if (!attackDetected) {
-                    // Attack stopped - can return to NORMAL
-                    pendingTransition_ = DefenseMode::NORMAL;
-                    pendingTransitionTime_ = currentTime + transitionDelay_;
-                    hasPendingTransition_ = true;
+                // Recovery: if attack stops, schedule return to NORMAL
+                if (!attackDetected) {
+                    if (!hasPendingTransition_) {
+                        pendingTransition_ = DefenseMode::NORMAL;
+                        pendingTransitionTime_ = currentTime + transitionDelay_;
+                        hasPendingTransition_ = true;
+                    }
+                } else {
+                    // Attack still ongoing, cancel any pending recovery
+                    if (hasPendingTransition_ && pendingTransition_ == DefenseMode::NORMAL) {
+                        hasPendingTransition_ = false;
+                    }
                 }
                 break;
         }
@@ -1088,10 +1068,6 @@ private:
                 // ACC fallback: h >= 3.16s (radar-only, no feedforward)
                 targetHeadway_ = HEADWAY_ACTIVE;
                 break;
-            case DefenseMode::DEGRADED:
-                // Conservative ACC: same as ACTIVE but with safety margins in fusion
-                targetHeadway_ = HEADWAY_DEGRADED;
-                break;
         }
     }
 
@@ -1099,7 +1075,6 @@ public:
 
     double fuseSensors(double v2vValue, double localValue) {
         // Compute fused sensor value based on current mode
-        // (matches MATLAB ACCHybridAutomaton.fuseSensors exactly)
         switch (currentMode_) {
             case DefenseMode::NORMAL:
                 // Trust V2V data
@@ -1112,11 +1087,6 @@ public:
             case DefenseMode::DEFENSE_ACTIVE:
                 // Use local sensor only
                 return localValue;
-
-            case DefenseMode::DEGRADED:
-                // Conservative: use minimum (closer = safer assumption)
-                // with safety margin
-                return std::min(v2vValue, localValue) * 0.9;
 
             default:
                 return localValue;
@@ -1136,8 +1106,7 @@ public:
 
     // Check if we should use ACC (no feedforward) vs CACC
     bool shouldUseACC() const {
-        return currentMode_ == DefenseMode::DEFENSE_ACTIVE ||
-               currentMode_ == DefenseMode::DEGRADED;
+        return currentMode_ == DefenseMode::DEFENSE_ACTIVE;
     }
 
     static const char* getModeString(DefenseMode mode) {
@@ -1145,7 +1114,6 @@ public:
             case DefenseMode::NORMAL: return "NORMAL";
             case DefenseMode::ATTACK_DETECTED: return "ATTACK_DETECTED";
             case DefenseMode::DEFENSE_ACTIVE: return "DEFENSE_ACTIVE";
-            case DefenseMode::DEGRADED: return "DEGRADED";
             default: return "UNKNOWN";
         }
     }

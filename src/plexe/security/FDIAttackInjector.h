@@ -9,24 +9,25 @@
 //
 // FDI Attack Types (Literature-Sourced):
 //
+// Verified attacks used in evaluation:
 //   0 = NONE            - No attack (benign baseline)
 //   1 = CONSTANT        - Constant fake speed value [van der Heijden VNC 2017]
 //   2 = OFFSET          - Speed offset attack [van der Heijden VNC 2017]
-//   3 = DRIFT           - Gradual speed drift/ramp [Amoozadeh IEEE CommMag 2015]
-//   4 = REPLAY          - Replay old BSM data [SAE J2735, ETSI ITS-G5]
-//   5 = NOISE           - Amplified measurement noise [REPLACE taxonomy]
+//   4 = REPLAY          - Replay old BSM data (3s experimental parameter)
 //   6 = ACCEL_OFFSET    - Acceleration offset [van der Heijden VNC 2017]
 //   7 = ACCEL_CONSTANT  - Constant fake acceleration [Amoozadeh IEEE CommMag 2015]
-//   8 = POSITION_SHIFT  - Position falsification [van der Heijden VNC 2017]
+//   8 = POSITION_SHIFT  - Position falsification (+30m) [Boddupalli REPLACE 2021]
+//
+// Deprecated attacks (kept for backwards compatibility):
+//   3 = DRIFT           - (unverified in source literature)
+//   5 = NOISE           - (unverified in source literature)
 //
 // References:
 //   [1] van der Heijden, Lukaseder, Kargl, "Analyzing Attacks on Cooperative
 //       Adaptive Cruise Control (CACC)", IEEE VNC 2017, pp. 45-52
 //   [2] Amoozadeh et al., "Security vulnerabilities of connected vehicle
 //       streams and their impact on cooperative driving", IEEE CommMag 2015
-//   [3] SAE J2735, "Dedicated Short Range Communications (DSRC) Message Set Dictionary"
-//   [4] ETSI TS 103 097, "Intelligent Transport Systems Security"
-//   [5] Boddupalli et al., "REPLACE: Real-time security assurance in vehicular
+//   [3] Boddupalli et al., "REPLACE: Real-time security assurance in vehicular
 //       platoons against V2V attacks", IEEE ITSC 2021
 //
 
@@ -126,7 +127,7 @@ public:
           noiseMultiplier_(10.0),      // NOISE: REPLACE taxonomy - 10x amplification
           accelOffset_(-30.0),         // ACCEL_OFFSET: van der Heijden -30 m/s²
           accelFakeValue_(6.0),        // ACCEL_CONSTANT: Amoozadeh 6 m/s²
-          positionShiftRate_(7.0),     // POSITION_SHIFT: van der Heijden 7 m/s
+          positionShiftRate_(30.0),    // POSITION_SHIFT: Boddupalli REPLACE +30m
           noiseStd_(0.5),              // van der Heijden: σ = 0.5 m/s
           underAttack_(false),
           attackStartValue_(NAN),
@@ -272,13 +273,12 @@ public:
             // POSITION FIELD ATTACKS
             //=================================================================
 
-            case AttackType::POSITION_SHIFT:  // Position falsification [van der Heijden VNC 2017]
-                // Paper: "position error that increases linearly over time"
-                // Table I: 3, 5, 7, 9, 11 m/s position shift rate
+            case AttackType::POSITION_SHIFT:  // Position falsification [Boddupalli REPLACE 2021]
+                // Boddupalli Table II: constant position mutation (+28m, +30m, etc.)
+                // Fixed offset attack on BSM position field
                 {
-                    double posShift = positionShiftRate_ * timeSinceAttack;
-                    value = trueValue + posShift + noise;
-                    injectedErrorOut_.record(posShift);
+                    value = trueValue + positionShiftRate_ + noise;
+                    injectedErrorOut_.record(positionShiftRate_);
                 }
                 break;
 

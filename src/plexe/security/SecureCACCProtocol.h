@@ -118,6 +118,11 @@ private:
     cOutVector headwayOut_;          // Current headway setting
     cOutVector activeControllerOut_; // 0=driver, 1=ACC, 2=CACC
 
+    // Ground truth vectors for unified mitigation metric
+    cOutVector trueSpeedOut_;        // Ground truth speed (before attack)
+    cOutVector trueAccelOut_;        // Ground truth accel (before attack)
+    cOutVector fusedAccelOut_;       // Defended accel output
+
 protected:
     virtual void initialize(int stage) override;
     virtual void messageReceived(PlatooningBeacon* pkt, veins::BaseFrame1609_4* frame) override;

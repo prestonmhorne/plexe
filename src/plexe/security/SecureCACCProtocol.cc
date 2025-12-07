@@ -63,6 +63,11 @@ SecureCACCProtocol::SecureCACCProtocol()
     attackActiveOut_.setName("attackActive");
     headwayOut_.setName("headway");
     activeControllerOut_.setName("activeController");
+
+    // Ground truth vectors for unified mitigation metric
+    trueSpeedOut_.setName("trueSpeed");
+    trueAccelOut_.setName("trueAccel");
+    fusedAccelOut_.setName("fusedAccel");
 }
 
 SecureCACCProtocol::~SecureCACCProtocol()
@@ -107,31 +112,35 @@ void SecureCACCProtocol::initialize(int stage)
             double duration = (attackDuration_ < 0) ?
                 std::numeric_limits<double>::infinity() : attackDuration_;
 
-            attacker_.configure(attackStartTime_, attackType, duration);
-
             // Set attack-specific parameters (all from peer-reviewed literature)
+            // Only configure the appropriate field attacker for each attack type
             switch (attackType) {
                 //=============================================================
                 // SPEED FIELD ATTACKS
                 //=============================================================
                 case AttackType::CONSTANT:
                     // van der Heijden VNC 2017: constant fake speed value
+                    attacker_.configure(attackStartTime_, attackType, duration);
                     attacker_.setFakeValue(attackMagnitude_);
                     break;
                 case AttackType::OFFSET:
                     // van der Heijden VNC 2017: speed offset attack (50, 100, 150 m/s)
+                    attacker_.configure(attackStartTime_, attackType, duration);
                     attacker_.setOffsetValue(attackMagnitude_);
                     break;
                 case AttackType::DRIFT:
                     // Amoozadeh IEEE CommMag 2015: gradual speed drift (m/s per second)
+                    attacker_.configure(attackStartTime_, attackType, duration);
                     attacker_.setDriftRate(attackMagnitude_);
                     break;
                 case AttackType::REPLAY:
                     // SAE J2735, ETSI ITS-G5: replay old BSM data (delay in seconds)
+                    attacker_.configure(attackStartTime_, attackType, duration);
                     attacker_.setReplayDelay(attackMagnitude_);
                     break;
                 case AttackType::NOISE:
                     // REPLACE taxonomy: amplified measurement noise (multiplier)
+                    attacker_.configure(attackStartTime_, attackType, duration);
                     attacker_.setNoiseMultiplier(attackMagnitude_);
                     break;
                 //=============================================================
@@ -355,7 +364,7 @@ void SecureCACCProtocol::messageReceived(PlatooningBeacon* pkt, BaseFrame1609_4*
             // Trigger attack detection on packet loss
             double confidence = 0.0, anomalyScore = 0.0;
             int votes = 2;  // Consider DoS as detected
-            automaton_.transition(true, currentTime, 1.0);
+            automaton_.transition(true, currentTime);
             defenseModeOut_.record(static_cast<int>(automaton_.getMode()));
         }
         return;
@@ -365,6 +374,10 @@ void SecureCACCProtocol::messageReceived(PlatooningBeacon* pkt, BaseFrame1609_4*
     // Record BSM and radar values
     bsmSpeedOut_.record(bsmSpeed);
     radarSpeedOut_.record(radarSpeed);
+
+    // Record ground truth for unified mitigation metric
+    trueSpeedOut_.record(trueBsmSpeed);
+    trueAccelOut_.record(trueBsmAccel);
 
     // Calculate residual for detection
     double residual = std::abs(bsmSpeed - radarSpeed);
@@ -405,10 +418,7 @@ void SecureCACCProtocol::messageReceived(PlatooningBeacon* pkt, BaseFrame1609_4*
         //=========================================================================
         // Hybrid Automaton State Transition
         //=========================================================================
-        // Local sensor confidence based on radar availability
-        double localSensorConfidence = 1.0;  // Assume radar always available in simulation
-
-        automaton_.transition(attackDetected, currentTime, localSensorConfidence);
+        automaton_.transition(attackDetected, currentTime);
 
         DefenseMode mode = automaton_.getMode();
         defenseModeOut_.record(static_cast<int>(mode));
@@ -418,6 +428,10 @@ void SecureCACCProtocol::messageReceived(PlatooningBeacon* pkt, BaseFrame1609_4*
         //=========================================================================
         fusedSpeed = automaton_.fuseSensors(bsmSpeed, radarSpeed);
         fusedSpeedOut_.record(fusedSpeed);
+
+        // Fuse acceleration as well (for unified mitigation metric)
+        double fusedAccel = automaton_.fuseSensors(bsmAccel, localAccel);
+        fusedAccelOut_.record(fusedAccel);
 
         // Log mode transitions
         if (attackDetected && votes >= 2) {
@@ -435,7 +449,6 @@ void SecureCACCProtocol::messageReceived(PlatooningBeacon* pkt, BaseFrame1609_4*
         //   NORMAL: h = 0.5s (full CACC with V2V feedforward)
         //   DETECTED: h = 1.24s (degraded CACC with estimated acceleration)
         //   ACTIVE: h = 3.16s (ACC fallback, radar-only)
-        //   DEGRADED: h = 3.16s (conservative ACC with safety margins)
         //=========================================================================
         if (automaton_.hasHeadwayChanged()) {
             applyHeadwayAdjustment();
@@ -450,6 +463,7 @@ void SecureCACCProtocol::messageReceived(PlatooningBeacon* pkt, BaseFrame1609_4*
         detectorVotesOut_.record(0);
         defenseModeOut_.record(0);  // Always NORMAL
         fusedSpeedOut_.record(bsmSpeed);  // Trust BSM directly (vulnerable)
+        fusedAccelOut_.record(bsmAccel);  // Trust BSM accel directly (vulnerable)
         headwayOut_.record(0.5);  // Fixed CACC headway
         activeControllerOut_.record(CACC);
     }
@@ -481,7 +495,7 @@ void SecureCACCProtocol::applyHeadwayAdjustment()
     EV_INFO << "Applying headway adjustment: h=" << targetHeadway
             << "s for mode " << automaton_.getModeString() << "\n";
 
-    // For DEFENSE_ACTIVE and DEGRADED modes, we should ideally switch to ACC
+    // For DEFENSE_ACTIVE mode, we should ideally switch to ACC
     // However, this requires changing the active controller which affects
     // the entire control architecture. For now, we adjust headway which
     // provides the primary safety benefit (increased following distance).
@@ -489,7 +503,7 @@ void SecureCACCProtocol::applyHeadwayAdjustment()
     // The Ploeg controller supports runtime headway changes via setPloegCACCParameters
 
     if (automaton_.shouldUseACC()) {
-        // In DEFENSE_ACTIVE or DEGRADED mode: use ACC-equivalent headway
+        // In DEFENSE_ACTIVE mode: use ACC-equivalent headway
         // This effectively disables feedforward benefits but ensures
         // string stability with radar-only measurements
         //
