@@ -4,7 +4,7 @@ Build and run the CACC security benchmark simulations.
 
 This script:
 1. Rebuilds the Plexe simulation with latest code changes
-2. Runs the PrimaryBenchmark configuration for all 6 verified attack types
+2. Runs the PrimaryBenchmark configuration for all 5 verified attack types
 3. Extracts and displays results
 
 Usage:
@@ -20,14 +20,13 @@ import sys
 import os
 from pathlib import Path
 
-# Attack configurations - 6 verified attacks from peer-reviewed literature
+# Attack configurations - 5 verified attacks from peer-reviewed literature
 ALL_ATTACKS = [
     'constant',
     'offset',
     'replay',
     'accel_offset',
     'accel_constant',
-    'position_shift',
 ]
 
 def run_command(cmd, cwd=None, description=None):

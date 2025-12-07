@@ -25,14 +25,13 @@ import sys
 from pathlib import Path
 
 # Attack configurations matching omnetpp.ini PrimaryBenchmark
-# 6 verified attacks from peer-reviewed literature
+# 5 verified attacks from peer-reviewed literature
 ATTACKS = [
     ('constant', '0 m/s', 'van der Heijden', 'speed'),
     ('offset', '+150 m/s', 'van der Heijden', 'speed'),
     ('replay', '3s delay', 'experimental', 'speed'),
     ('accel_offset', '-30 m/s^2', 'van der Heijden', 'accel'),
     ('accel_constant', '+6 m/s^2', 'Amoozadeh', 'accel'),
-    ('position_shift', '+30 m', 'Boddupalli', 'position'),
 ]
 
 # Simulation parameters
